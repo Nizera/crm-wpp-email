@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local database (contains sensitive data - do not commit)
+*.sqlite
+*.sqlite3
