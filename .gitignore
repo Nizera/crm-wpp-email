@@ -43,3 +43,7 @@ next-env.d.ts
 # local database (contains sensitive data - do not commit)
 *.sqlite
 *.sqlite3
+
+# local runtime/session files
+wa_auth_session/
+dev-server.*.log

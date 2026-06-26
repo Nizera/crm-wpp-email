@@ -23,7 +23,7 @@
 - [Instalação e Execução](#-instalação-e-execução)
 - [Configuração das Integrações](#-configuração-das-integrações)
   - [Resend (E-mail)](#resend-e-mail)
-  - [Evolution API (WhatsApp)](#evolution-api-whatsapp)
+  - [Baileys (WhatsApp)](#baileys-whatsapp)
   - [Agente de IA](#agente-de-ia)
   - [Google Places API (Opcional)](#google-places-api-opcional)
 - [Estrutura do Projeto](#-estrutura-do-projeto)
@@ -79,20 +79,20 @@ O sistema opera em dois modos:
 
 ### 💬 WhatsApp Integrado
 - **Tela de chat estilo WhatsApp Web** com listagem de contatos
-- Envio e recebimento de mensagens via **Evolution API**
+- Envio e recebimento de mensagens via **Baileys** conectado ao WhatsApp Web
 - **Agente de IA Comercial** que responde leads automaticamente (Gemini, OpenAI ou Mock)
 - Ativar/desativar o agente por contato individualmente
 - Polling automático para mensagens em tempo real
 
 ### ✅ Validação Automática de WhatsApp
-- Verifica se o número existe no WhatsApp via endpoint `checkNumber` da Evolution API
+- Verifica se o número existe no WhatsApp via Baileys
 - Validação automática ao **criar** ou **alterar** o telefone de um contato
 - Botão "Checar" manual no modal de edição e no cabeçalho do chat
 - Modo Mock: número começa com `999` ou `000` = Sem WhatsApp
 
 ### ⚙️ Configurações Centralizadas
 - Painel de configurações com todas as chaves de API
-- Simulador de mensagem recebida (para testar o agente sem Evolution API)
+- Simulador de mensagem recebida para testar o agente
 - Prompt personalizável para o agente de IA
 
 ---
@@ -107,7 +107,7 @@ O sistema opera em dois modos:
 | **Estilo** | CSS Vanilla (dark mode, glassmorphism, neon) |
 | **Ícones** | [Lucide React](https://lucide.dev/) |
 | **E-mail** | [Resend](https://resend.com/) |
-| **WhatsApp** | [Evolution API](https://evolution-api.com/) (self-hosted) |
+| **WhatsApp** | [Baileys](https://github.com/WhiskeySockets/Baileys) |
 | **Prospecção** | OpenStreetMap Overpass API + Google Places API |
 | **IA** | Google Gemini / OpenAI GPT / Mock Rules |
 
@@ -160,33 +160,14 @@ Todas as configurações são feitas diretamente na página **Configurações** 
 3. Adicione seu domínio verificado (ou use `onboarding@resend.dev` para testes)
 4. Cole a chave em **Configurações → Resend API Key**
 
-### Evolution API (WhatsApp)
+### Baileys (WhatsApp)
 
-A Evolution API é um servidor self-hosted que conecta ao WhatsApp. Recomendamos rodar via Docker:
+O WhatsApp conecta diretamente pelo CRM usando Baileys.
 
-```bash
-docker run -d \
-  --name evolution-api \
-  -p 8080:8080 \
-  -e AUTHENTICATION_API_KEY=sua-chave-aqui \
-  atendai/evolution-api:latest
-```
-
-Após iniciar:
-1. Acesse `http://localhost:8080` e crie uma instância
-2. Escaneie o QR Code com seu WhatsApp
-3. Configure em **Configurações → Evolution API**:
-   - URL: `http://localhost:8080`
-   - API Token: sua chave
-   - Nome da Instância: nome que você criou
-
-#### Webhook (Mensagens Recebidas)
-
-Para receber mensagens automaticamente, configure o webhook na Evolution API apontando para:
-
-```
-http://SEU-IP:3005/api/whatsapp/webhook
-```
+1. Acesse **Configuracoes -> WhatsApp**
+2. Clique em **Conectar**
+3. Escaneie o QR Code com o WhatsApp no celular em **Dispositivos conectados**
+4. Mantenha o servidor do CRM ativo para enviar, receber e validar contatos
 
 ### Agente de IA
 
@@ -234,7 +215,7 @@ src/
 │   │       ├── send/             # Envio manual de mensagem
 │   │       ├── simulate-receive/ # Simulador de mensagem recebida
 │   │       ├── toggle-agent/     # Ativar/desativar agente de IA
-│   │       └── webhook/          # Webhook da Evolution API
+│   │       └── baileys/          # Conexao direta com WhatsApp Web
 │   ├── automacoes/               # Página de automações + Flow Builder
 │   ├── configuracoes/            # Página de configurações
 │   ├── contatos/                 # Página de CRM de contatos

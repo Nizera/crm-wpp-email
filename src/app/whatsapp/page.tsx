@@ -411,7 +411,7 @@ export default function WhatsAppPage() {
                 Selecione uma conversa na lista lateral para visualizar as mensagens e responder em tempo real.
               </p>
               <div style={{ marginTop: '30px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                <span>🔒 Criptografado de ponta a ponta com Evolution API</span>
+                <span>🔒 Criptografado de ponta a ponta via WhatsApp Web</span>
               </div>
             </div>
           ) : (

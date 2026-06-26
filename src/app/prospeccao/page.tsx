@@ -23,9 +23,12 @@ interface Lead {
   street: string;
   city: string;
   state: string;
+  whatsapp_valid?: boolean;
+  contact_method?: 'whatsapp' | 'email';
 }
 
-type SearchSource = 'osm' | 'google';
+type SearchSource = 'serper' | 'osm' | 'google';
+type SearchScope = 'city' | 'state' | 'country';
 
 type EnrichStatus = 'idle' | 'loading' | 'found' | 'not_found' | 'no_key';
 
@@ -46,19 +49,21 @@ const NICHES = [
 
 export default function ProspeccaoPage() {
   const [city, setCity] = useState('Tampa, FL');
+  const [searchScope, setSearchScope] = useState<SearchScope>('city');
   const [niche, setNiche] = useState('dentist');
-  const [source, setSource] = useState<SearchSource>('osm');
+  const [source, setSource] = useState<SearchSource>('serper');
   const [loading, setLoading] = useState(false);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [crmEmails, setCrmEmails] = useState<Set<string>>(new Set());
   const [crmNames, setCrmNames] = useState<Set<string>>(new Set());
   const [importStatus, setImportStatus] = useState<Record<string, 'idle' | 'importing' | 'done' | 'error'>>({});
   const [editedEmails, setEditedEmails] = useState<Record<string, string>>({});
-  const [searchSummary, setSearchSummary] = useState<{ total: number; target: number; city: string } | null>(null);
+  const [searchSummary, setSearchSummary] = useState<{ total: number; target: number; city: string; whatsapp: number; emailOnly: number; warning?: string } | null>(null);
   const [enrichStatus, setEnrichStatus] = useState<Record<string, EnrichStatus>>({});
   const [enrichAll, setEnrichAll] = useState(false);
   const [hasHunterKey, setHasHunterKey] = useState<boolean | null>(null);
   const [hasGoogleKey, setHasGoogleKey] = useState<boolean | null>(null);
+  const [hasSerperKey, setHasSerperKey] = useState<boolean | null>(null);
 
   useEffect(() => {
     loadCrmContacts();
@@ -72,12 +77,14 @@ export default function ProspeccaoPage() {
         const s = await res.json();
         setHasHunterKey(!!(s.hunter_api_key?.trim()));
         setHasGoogleKey(!!(s.google_places_api_key?.trim()));
-        // Auto-select Google if key is present
-        if (s.google_places_api_key?.trim()) setSource('google');
+        setHasSerperKey(!!(s.serper_api_key?.trim()));
+        if (s.serper_api_key?.trim()) setSource('serper');
+        else if (s.google_places_api_key?.trim()) setSource('google');
       }
     } catch {
       setHasHunterKey(false);
       setHasGoogleKey(false);
+      setHasSerperKey(false);
     }
   };
 
@@ -102,7 +109,7 @@ export default function ProspeccaoPage() {
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!city || !niche) return;
+    if ((!city && searchScope !== 'country') || !niche) return;
 
     setLoading(true);
     setLeads([]);
@@ -112,8 +119,13 @@ export default function ProspeccaoPage() {
     setEnrichStatus({});
 
     try {
-      const query = new URLSearchParams({ city, niche });
-      const endpoint = source === 'google' ? `/api/leads/google?${query}` : `/api/leads/search?${query}`;
+      const query = new URLSearchParams({ city, niche, target: '100', scope: searchScope });
+      const endpoint =
+        source === 'serper'
+          ? `/api/leads/serper?${query}`
+          : source === 'google'
+          ? `/api/leads/google?${query}`
+          : `/api/leads/search?${query}`;
       const res = await fetch(endpoint);
       const data = await res.json();
 
@@ -122,7 +134,10 @@ export default function ProspeccaoPage() {
         setSearchSummary({
           total: data.total_found || 0,
           target: data.without_website || 0,
-          city: data.city || city,
+          city: data.city || (searchScope === 'country' ? 'United States' : city),
+          whatsapp: data.whatsapp_valid || 0,
+          emailOnly: data.email_only || 0,
+          warning: data.warning,
         });
       } else {
         alert(data.error || 'Ocorreu um erro na busca.');
@@ -190,9 +205,10 @@ export default function ProspeccaoPage() {
   const handleImport = async (lead: Lead) => {
     const leadKey = getLeadKey(lead);
     const emailToUse = (editedEmails[leadKey] !== undefined ? editedEmails[leadKey] : lead.email).trim();
+    const hasQualifiedContact = lead.whatsapp_valid || !!emailToUse;
 
-    if (!emailToUse) {
-      alert('Por favor, insira ou busque um e-mail para este lead antes de importar.');
+    if (!hasQualifiedContact) {
+      alert('Este lead precisa ter WhatsApp valido ou e-mail antes de importar.');
       return;
     }
 
@@ -211,14 +227,16 @@ export default function ProspeccaoPage() {
           city: lead.city,
           state: lead.state,
           status: 'Novo',
-          tags: source === 'google' ? 'Google-Prospect' : 'OSM-Prospect',
-          notes: `Importado via ${source === 'google' ? 'Google Places' : 'OpenStreetMap'} — ${lead.address || lead.street || 'Endereço não disponível'}`
+          tags: source === 'serper' ? 'Serper-Prospect' : source === 'google' ? 'Google-Prospect' : 'OSM-Prospect',
+          notes: `Importado via ${source === 'serper' ? 'Serper' : source === 'google' ? 'Google Places' : 'OpenStreetMap'} - contato principal: ${lead.whatsapp_valid ? 'WhatsApp validado' : 'E-mail'} - ${lead.address || lead.street || 'Endereco nao disponivel'}`
         })
       });
 
       if (res.ok) {
         setImportStatus(prev => ({ ...prev, [leadKey]: 'done' }));
-        setCrmEmails(prev => { const s = new Set(prev); s.add(emailToUse.toLowerCase()); return s; });
+        if (emailToUse) {
+          setCrmEmails(prev => { const s = new Set(prev); s.add(emailToUse.toLowerCase()); return s; });
+        }
         setCrmNames(prev => { const s = new Set(prev); s.add(lead.name.toLowerCase().trim()); return s; });
       } else {
         const err = await res.json();
@@ -276,6 +294,15 @@ export default function ProspeccaoPage() {
       <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
         <button
           type="button"
+          onClick={() => { if (!hasSerperKey) { alert('Configure sua Serper API Key nas Configuracoes primeiro.'); return; } setSource('serper'); }}
+          className={source === 'serper' ? 'btn btn-primary' : 'btn btn-secondary'}
+          style={{ padding: '8px 16px', fontSize: '0.85rem' }}
+          title={!hasSerperKey ? 'Configure a Serper API Key nas Configuracoes' : 'Busca principal: 100 leads sem website com WhatsApp validado ou e-mail'}
+        >
+          {hasSerperKey ? 'OK' : 'Key'} Serper {!hasSerperKey && '(Configurar)'}
+        </button>
+        <button
+          type="button"
           onClick={() => setSource('osm')}
           className={source === 'osm' ? 'btn btn-primary' : 'btn btn-secondary'}
           style={{ padding: '8px 16px', fontSize: '0.85rem' }}
@@ -295,18 +322,28 @@ export default function ProspeccaoPage() {
 
       {/* Search form */}
       <form onSubmit={handleSearch} className="glass" style={{ padding: '24px', display: 'flex', gap: '20px', alignItems: 'flex-end', marginBottom: '32px', flexWrap: 'wrap' }}>
+        <div style={{ flex: '0 1 180px' }}>
+          <label className="form-label">Escopo</label>
+          <select className="form-select" value={searchScope} onChange={(e) => setSearchScope(e.target.value as SearchScope)}>
+            <option value="city">Cidade</option>
+            <option value="state">Estado inteiro</option>
+            <option value="country">Pais inteiro</option>
+          </select>
+        </div>
+
         <div style={{ flex: '1 1 200px' }}>
           <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
             <MapPin size={14} style={{ color: 'var(--accent-primary)' }} />
-            <span>Cidade e Estado (EUA)</span>
+            <span>{searchScope === 'state' ? 'Estado (EUA)' : 'Cidade e Estado (EUA)'}</span>
           </label>
           <input
             type="text"
             className="form-input"
-            placeholder="ex: Tampa, FL | Charlotte, NC"
+            placeholder={searchScope === 'state' ? 'ex: FL | TX | CA' : 'ex: Tampa, FL | Charlotte, NC'}
             value={city}
             onChange={(e) => setCity(e.target.value)}
-            required
+            required={searchScope !== 'country'}
+            disabled={searchScope === 'country'}
           />
         </div>
 
@@ -343,6 +380,12 @@ export default function ProspeccaoPage() {
               {leadsWithEmail > 0 && (
                 <> · <strong style={{ color: 'var(--accent-green)' }}>{leadsWithEmail}</strong> com e-mail</>
               )}
+              {searchSummary.whatsapp > 0 && (
+                <> - <strong style={{ color: 'var(--accent-green)' }}>{searchSummary.whatsapp}</strong> WhatsApp validado</>
+              )}
+              {searchSummary.emailOnly > 0 && (
+                <> - <strong style={{ color: 'var(--accent-blue)' }}>{searchSummary.emailOnly}</strong> somente e-mail</>
+              )}
             </span>
           </div>
           {leads.length > 0 && (
@@ -366,7 +409,7 @@ export default function ProspeccaoPage() {
       {loading ? (
         <div style={{ textAlign: 'center', padding: '80px 20px' }}>
           <Loader2 size={48} style={{ color: 'var(--accent-primary)', margin: '0 auto 16px', animation: 'spin 1s linear infinite' }} />
-          <p style={{ fontWeight: 600 }}>Consultando OpenStreetMap...</p>
+          <p style={{ fontWeight: 600 }}>Consultando {source === 'serper' ? 'Serper' : source === 'google' ? 'Google Places' : 'OpenStreetMap'}...</p>
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Filtrando negócios sem website.</span>
         </div>
       ) : leads.length > 0 ? (
@@ -396,7 +439,12 @@ export default function ProspeccaoPage() {
                     <td style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
                       {lead.street ? `${lead.street}, ` : ''}{lead.city}, {lead.state}
                     </td>
-                    <td style={{ fontSize: '0.85rem' }}>{lead.phone || <span style={{ color: 'var(--text-muted)' }}>n/d</span>}</td>
+                    <td style={{ fontSize: '0.85rem' }}>
+                      {lead.phone || <span style={{ color: 'var(--text-muted)' }}>n/d</span>}
+                      {lead.whatsapp_valid && (
+                        <div style={{ marginTop: '4px', color: 'var(--accent-green)', fontSize: '0.72rem' }}>WhatsApp valido</div>
+                      )}
+                    </td>
 
                     {/* Email cell */}
                     <td>
@@ -472,10 +520,10 @@ export default function ProspeccaoPage() {
                       ) : (
                         <button
                           onClick={() => handleImport(lead)}
-                          disabled={currentStatus === 'importing' || !currentEmail}
+                          disabled={currentStatus === 'importing' || (!currentEmail && !lead.whatsapp_valid)}
                           className="btn btn-primary glow-on-hover"
-                          style={{ padding: '6px 12px', fontSize: '0.8rem', width: '100%', opacity: !currentEmail ? 0.4 : 1 }}
-                          title={!currentEmail ? 'Busque ou insira um e-mail primeiro' : 'Adicionar ao CRM'}
+                          style={{ padding: '6px 12px', fontSize: '0.8rem', width: '100%', opacity: (!currentEmail && !lead.whatsapp_valid) ? 0.4 : 1 }}
+                          title={!currentEmail && !lead.whatsapp_valid ? 'Precisa ter WhatsApp valido ou e-mail' : 'Adicionar ao CRM'}
                         >
                           {currentStatus === 'importing'
                             ? <><Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /><span>Importando...</span></>

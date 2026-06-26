@@ -24,8 +24,15 @@ export async function POST(req: NextRequest) {
 
     console.log(`[API WhatsApp Send] Enviando manual para contato ${contactId} (${contact.phone})`);
     
-    // Call the helper to send (saves to DB automatically)
-    await sendWhatsappMessage(contact.id, contact.phone, text);
+    // Call the helper to send via Baileys.
+    const sent = await sendWhatsappMessage(contact.id, contact.phone, text);
+
+    if (!sent) {
+      return NextResponse.json(
+        { error: 'O Baileys nao confirmou o envio da mensagem. Verifique se o WhatsApp esta conectado.' },
+        { status: 502 }
+      );
+    }
 
     return NextResponse.json({ success: true, message: 'Mensagem enviada com sucesso' });
   } catch (error: any) {

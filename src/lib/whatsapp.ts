@@ -1,4 +1,15 @@
 import { getDb } from './db';
+import {
+  buildJidMap,
+  getBaileysSock,
+  getBaileysStatus,
+  onBaileysConnected,
+  registerJidMapping,
+  resolveJid,
+  sendBaileysMessage,
+  setBaileysMessageHandler,
+  startBaileys,
+} from './baileys-client';
 
 export interface WhatsappMessage {
   id?: number;
@@ -6,15 +17,14 @@ export interface WhatsappMessage {
   direction: 'inbound' | 'outbound';
   body: string;
   sent_at?: string;
+  whatsapp_message_id?: string;
 }
 
-// Clean formatting from phone numbers to leave only digits
 export function cleanPhoneNumber(phone: string): string {
   if (!phone) return '';
   return phone.replace(/\D/g, '');
 }
 
-// Helper to replace variable tags in text templates
 function replaceVariables(text: string, contact: any): string {
   if (!text) return '';
   return text
@@ -27,121 +37,148 @@ function replaceVariables(text: string, contact: any): string {
     .replace(/\{\{state\}\}/gi, contact.state || '');
 }
 
-// Send WhatsApp message using Evolution API or Mock Mode
-export async function sendWhatsappMessage(contactId: number, phone: string, text: string): Promise<boolean> {
+async function findOrCreateWhatsappContact(
+  phone: string,
+  pushName?: string,
+  direction: 'inbound' | 'outbound' = 'inbound'
+) {
   const db = await getDb();
-  
-  // Load Settings
-  const settingsList = await db.all('SELECT * FROM settings');
-  const settings: Record<string, string> = {};
-  settingsList.forEach(row => {
-    settings[row.key] = row.value || '';
+  const contacts = await db.all('SELECT * FROM contacts');
+  const cleanedInput = cleanPhoneNumber(phone);
+
+  const contact = contacts.find((c: any) => {
+    if (!c.phone) return false;
+    const cleanedC = cleanPhoneNumber(c.phone);
+    return cleanedInput.endsWith(cleanedC) || cleanedC.endsWith(cleanedInput);
   });
 
-  const url = settings['evolution_api_url'] || '';
-  const token = settings['evolution_api_token'] || '';
-  const instanceName = settings['evolution_instance_name'] || '';
-  const cleanedPhone = cleanPhoneNumber(phone);
+  if (contact) return { contact, created: false };
 
-  let sentReal = false;
+  const name = direction === 'inbound'
+    ? (pushName?.trim() || cleanedInput || 'Contato WhatsApp')
+    : (cleanedInput || 'Contato WhatsApp');
 
-  if (url && token && instanceName && cleanedPhone) {
-    try {
-      console.log(`[WhatsApp] Tentando enviar mensagem real para ${cleanedPhone} via Evolution API...`);
-      // URL endpoint: {api_url}/message/sendText/{instanceName}
-      const response = await fetch(`${url.replace(/\/$/, '')}/message/sendText/${instanceName}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': token
-        },
-        body: JSON.stringify({
-          number: cleanedPhone,
-          text: text
-        })
-      });
+  const result = await db.run(
+    `INSERT INTO contacts (name, phone, status, tags, notes, whatsapp_status, updated_at)
+     VALUES (?, ?, 'Novo', 'WhatsApp', 'Criado automaticamente ao sincronizar mensagem do WhatsApp.', 'Válido', CURRENT_TIMESTAMP)`,
+    name,
+    cleanedInput
+  );
 
-      if (response.ok) {
-        console.log(`[WhatsApp] Mensagem enviada com sucesso para ${cleanedPhone} via API.`);
-        sentReal = true;
-      } else {
-        const errorData = await response.text();
-        console.error(`[WhatsApp API Error] Status: ${response.status}. Detalhes:`, errorData);
-      }
-    } catch (error) {
-      console.error(`[WhatsApp API Error] Falha de conexão ao enviar mensagem:`, error);
+  const createdContact = await db.get('SELECT * FROM contacts WHERE id = ?', result.lastID);
+  console.log(`[WhatsApp Sync] Contato criado automaticamente: ${name} (${cleanedInput})`);
+
+  return { contact: createdContact, created: true };
+}
+
+async function saveWhatsappMessageOnce(
+  contactId: number,
+  direction: 'inbound' | 'outbound',
+  text: string,
+  whatsappMessageId?: string
+) {
+  const db = await getDb();
+
+  if (whatsappMessageId) {
+    const existing = await db.get(
+      'SELECT id FROM whatsapp_messages WHERE whatsapp_message_id = ?',
+      whatsappMessageId
+    );
+
+    if (existing) {
+      return { inserted: false, id: existing.id };
     }
   }
 
-  if (!sentReal) {
-    console.log(`\n==================================================`);
-    console.log(`[WhatsApp MOCK Outbound]`);
-    console.log(`Para: ${phone} (${cleanedPhone})`);
-    console.log(`Mensagem: "${text}"`);
-    console.log(`==================================================\n`);
-  }
-
-  // Save outbound message to DB
-  await db.run(
-    "INSERT INTO whatsapp_messages (contact_id, direction, body, sent_at) VALUES (?, 'outbound', ?, CURRENT_TIMESTAMP)",
+  const result = await db.run(
+    'INSERT INTO whatsapp_messages (contact_id, direction, body, sent_at, whatsapp_message_id) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)',
     contactId,
-    text
+    direction,
+    text,
+    whatsappMessageId || null
   );
 
+  return { inserted: true, id: result.lastID };
+}
+
+export async function sendWhatsappMessage(contactId: number, phone: string, text: string): Promise<boolean> {
+  const db = await getDb();
+  const cleanedPhone = cleanPhoneNumber(phone);
+  const savedMessage = await saveWhatsappMessageOnce(contactId, 'outbound', text);
+
+  const baileysStatus = getBaileysStatus();
+  if (baileysStatus.state !== 'connected' || !cleanedPhone) {
+    console.warn(`[WhatsApp] Baileys nao esta conectado. Mensagem nao enviada para ${cleanedPhone || phone}.`);
+    return false;
+  }
+
+  const actualJid = await resolveJid(cleanedPhone);
+  const jid = actualJid || `${cleanedPhone}@s.whatsapp.net`;
+
+  if (actualJid) {
+    registerJidMapping(actualJid, cleanedPhone);
+    console.log(`[WhatsApp] JID real resolvido para ${cleanedPhone}: ${actualJid}`);
+  }
+
+  console.log(`[WhatsApp] Tentando enviar via Baileys para ${jid}...`);
+  const messageId = await sendBaileysMessage(jid, text, cleanedPhone);
+  if (!messageId) {
+    console.error(`[WhatsApp] Baileys falhou ao enviar para ${jid}`);
+    return false;
+  }
+
+  if (savedMessage.id && messageId !== 'sent') {
+    await db.run(
+      'UPDATE whatsapp_messages SET whatsapp_message_id = ? WHERE id = ? AND whatsapp_message_id IS NULL',
+      messageId,
+      savedMessage.id
+    );
+  }
+
+  console.log(`[WhatsApp] Mensagem enviada via Baileys para ${jid}`);
   return true;
 }
 
-// Generate Response using Gemini, OpenAI or Mock rules
-export async function generateAIResponse(contact: any, history: WhatsappMessage[], systemPromptTemplate: string): Promise<string> {
+export async function generateAIResponse(
+  contact: any,
+  history: WhatsappMessage[],
+  systemPromptTemplate: string
+): Promise<string> {
   const db = await getDb();
-  
-  // Load Settings
   const settingsList = await db.all('SELECT * FROM settings');
   const settings: Record<string, string> = {};
-  settingsList.forEach(row => {
+  settingsList.forEach((row: any) => {
     settings[row.key] = row.value || '';
   });
 
-  const provider = settings['whatsapp_agent_provider'] || 'mock';
-  const model = settings['whatsapp_agent_model'] || 'gemini-1.5-flash';
-  const apiKey = settings['whatsapp_agent_api_key'] || '';
-
-  // Clean prompt and replace variables
+  const provider = settings.whatsapp_agent_provider || 'mock';
+  const model = settings.whatsapp_agent_model || 'gemini-1.5-flash';
+  const apiKey = settings.whatsapp_agent_api_key || '';
   const systemPrompt = replaceVariables(systemPromptTemplate, contact);
-
-  // Format conversation history
-  const historyText = history.map(m => `${m.direction === 'inbound' ? 'Lead' : 'Agente'}: ${m.body}`).join('\n');
+  const historyText = history
+    .map((m) => `${m.direction === 'inbound' ? 'Lead' : 'Agente'}: ${m.body}`)
+    .join('\n');
 
   if (provider === 'gemini' && apiKey) {
     try {
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      const userContent = `Histórico da conversa:\n${historyText}\n\nResponda ao Lead de forma sucinta e persuasiva no WhatsApp. Responda apenas com a mensagem a ser enviada pelo Agente, sem aspas, prefixos ou formatação Markdown no corpo do texto.`;
-      
+      const userContent = `Historico da conversa:\n${historyText}\n\nResponda ao lead de forma sucinta e persuasiva no WhatsApp. Responda apenas com a mensagem a ser enviada pelo agente, sem aspas, prefixos ou Markdown.`;
+
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: userContent }]
-            }
-          ],
-          systemInstruction: {
-            parts: [{ text: systemPrompt }]
-          }
-        })
+          contents: [{ role: 'user', parts: [{ text: userContent }] }],
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+        }),
       });
 
       if (response.ok) {
         const json = await response.json();
         const generatedText = json.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (generatedText) {
-          return generatedText.trim();
-        }
+        if (generatedText) return generatedText.trim();
       } else {
-        const errText = await response.text();
-        console.error('[Gemini API Error]', errText);
+        console.error('[Gemini API Error]', await response.text());
       }
     } catch (e) {
       console.error('[Gemini API Connection Error]', e);
@@ -150,120 +187,95 @@ export async function generateAIResponse(contact: any, history: WhatsappMessage[
 
   if (provider === 'openai' && apiKey) {
     try {
-      const endpoint = `https://api.openai.com/v1/chat/completions`;
       const messages = [
-        { role: 'system', content: systemPrompt },
-        ...history.map(m => ({
+        { role: 'system' as const, content: systemPrompt },
+        ...history.map((m) => ({
           role: m.direction === 'inbound' ? 'user' as const : 'assistant' as const,
-          content: m.body
+          content: m.body,
         })),
-        { role: 'user' as const, content: 'Gere a próxima resposta de WhatsApp curta para o lead, sem aspas nem prefixos.' }
+        { role: 'user' as const, content: 'Gere a proxima resposta curta de WhatsApp para o lead, sem aspas nem prefixos.' },
       ];
 
-      const response = await fetch(endpoint, {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
+          Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({
-          model: model,
-          messages: messages,
-          temperature: 0.7
-        })
+        body: JSON.stringify({ model, messages, temperature: 0.7 }),
       });
 
       if (response.ok) {
         const json = await response.json();
         const reply = json.choices?.[0]?.message?.content;
-        if (reply) {
-          return reply.trim();
-        }
+        if (reply) return reply.trim();
       } else {
-        const errText = await response.text();
-        console.error('[OpenAI API Error]', errText);
+        console.error('[OpenAI API Error]', await response.text());
       }
     } catch (e) {
       console.error('[OpenAI API Connection Error]', e);
     }
   }
 
-  // Fallback Rule-Based Mock Agent
-  console.log(`[WhatsApp Agent] Usando motor Simulado (Mock) para gerar resposta.`);
-  
-  const lastInbound = history.filter(m => m.direction === 'inbound').pop()?.body || '';
+  console.log('[WhatsApp Agent] Usando motor simulado para gerar resposta.');
+  const lastInbound = history.filter((m) => m.direction === 'inbound').pop()?.body || '';
   const textLower = lastInbound.toLowerCase();
 
-  // Simple heuristic responses in Portuguese and English
   if (textLower.match(/(sim|quero|agendar|pode ser|ok|yes|sure|interest|schedule|appointment)/i)) {
-    return `Perfeito! Qual seria o melhor dia e horário na próxima semana para uma rápida conversa de 5 minutos por telefone?`;
-  }
-  
-  if (textLower.match(/(não|nao|obrigado|no thanks|not interested|rejeito)/i)) {
-    return `Entendido. Sem problemas! Se precisar de um site profissional no futuro para destacar sua empresa em ${contact.city || 'Google'}, estaremos à disposição. Muito sucesso com seus negócios!`;
+    return 'Perfeito! Qual seria o melhor dia e horario na proxima semana para uma rapida conversa de 5 minutos por telefone?';
   }
 
-  if (history.filter(m => m.direction === 'outbound').length === 0) {
-    // Opening pitch
-    return `Olá, tudo bem? Vi o perfil da sua empresa, ${contact.name}, que presta serviços em ${contact.city || 'sua região'}. Notei que vocês ainda não possuem um website oficial. Gostaria de agendar um bate-papo rápido de 5 minutos para eu te mostrar como um site profissional pode trazer mais clientes?`;
+  if (textLower.match(/(nao|obrigado|no thanks|not interested|rejeito)/i)) {
+    return `Entendido. Sem problemas! Se precisar de um site profissional no futuro para destacar sua empresa em ${contact.city || 'Google'}, estaremos a disposicao. Muito sucesso com seus negocios!`;
   }
 
-  return `Entendi! Fico à disposição. Deseja agendar a rápida demonstração de 5 minutos para a próxima segunda ou terça-feira?`;
+  if (history.filter((m) => m.direction === 'outbound').length === 0) {
+    return `Ola, tudo bem? Vi o perfil da sua empresa, ${contact.name}, que presta servicos em ${contact.city || 'sua regiao'}. Notei que voces ainda nao possuem um website oficial. Gostaria de agendar um bate-papo rapido de 5 minutos para eu te mostrar como um site profissional pode trazer mais clientes?`;
+  }
+
+  return 'Entendi! Fico a disposicao. Deseja agendar a rapida demonstracao de 5 minutos para a proxima segunda ou terca-feira?';
 }
 
-// Process Inbound message from WhatsApp lead
-export async function processIncomingWhatsapp(phone: string, text: string): Promise<{ success: boolean; contactMatched: boolean; replyText?: string }> {
+export async function processWhatsappSyncMessage(
+  phone: string,
+  text: string,
+  direction: 'inbound' | 'outbound' = 'inbound',
+  whatsappMessageId?: string,
+  pushName?: string
+): Promise<{ success: boolean; contactMatched: boolean; replyText?: string }> {
   try {
     const db = await getDb();
-    const contacts = await db.all("SELECT * FROM contacts");
-    const cleanedInput = cleanPhoneNumber(phone);
+    const { contact, created } = await findOrCreateWhatsappContact(phone, pushName, direction);
 
-    // Try matching lead by phone
-    const contact = contacts.find(c => {
-      if (!c.phone) return false;
-      const cleanedC = cleanPhoneNumber(c.phone);
-      return cleanedInput.endsWith(cleanedC) || cleanedC.endsWith(cleanedInput);
-    });
+    console.log(`[WhatsApp Sync] Mensagem ${direction} de ${contact.name} (ID: ${contact.id}): "${text}"`);
 
-    if (!contact) {
-      console.log(`[WhatsApp Inbound] Mensagem recebida de ${phone}, mas o telefone não consta em nenhum lead do CRM.`);
-      return { success: true, contactMatched: false };
+    const saved = await saveWhatsappMessageOnce(contact.id, direction, text, whatsappMessageId);
+    if (!saved.inserted) {
+      return { success: true, contactMatched: true };
     }
 
-    console.log(`[WhatsApp Inbound] Mensagem recebida de ${contact.name} (ID: ${contact.id}): "${text}"`);
-
-    // 1. Insert inbound message to DB
-    await db.run(
-      "INSERT INTO whatsapp_messages (contact_id, direction, body, sent_at) VALUES (?, 'inbound', ?, CURRENT_TIMESTAMP)",
-      contact.id,
-      text
-    );
-
-    // 2. Update CRM status to 'Respondido'
-    await db.run(
-      "UPDATE contacts SET status = 'Respondido', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-      contact.id
-    );
-
-    // 3. If AI agent is active, trigger reply
-    if (contact.whatsapp_agent_active === 1) {
-      // Get settings for prompt template
-      const promptRow = await db.get("SELECT value FROM settings WHERE key = 'whatsapp_agent_prompt'");
-      const systemPromptTemplate = promptRow?.value || "Você é um assistente comercial.";
-
-      // Load last 15 messages for context
-      const chatHistory = await db.all(
-        "SELECT * FROM whatsapp_messages WHERE contact_id = ? ORDER BY sent_at ASC LIMIT 15",
+    if (direction === 'inbound') {
+      await db.run(
+        "UPDATE contacts SET status = 'Respondido', whatsapp_status = 'Válido', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         contact.id
       );
+    } else if (created) {
+      await db.run(
+        "UPDATE contacts SET whatsapp_status = 'Válido', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        contact.id
+      );
+    }
 
-      // Generate AI response
+    if (direction === 'inbound' && contact.whatsapp_agent_active === 1) {
+      const promptRow = await db.get("SELECT value FROM settings WHERE key = 'whatsapp_agent_prompt'");
+      const systemPromptTemplate = promptRow?.value || 'Voce e um assistente comercial.';
+      const chatHistory = await db.all(
+        'SELECT * FROM whatsapp_messages WHERE contact_id = ? ORDER BY sent_at ASC LIMIT 15',
+        contact.id
+      );
       const aiReply = await generateAIResponse(contact, chatHistory, systemPromptTemplate);
 
-      // Wait 1 second to simulate typing delay
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // Send reply
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       await sendWhatsappMessage(contact.id, contact.phone, aiReply);
 
       return { success: true, contactMatched: true, replyText: aiReply };
@@ -271,67 +283,77 @@ export async function processIncomingWhatsapp(phone: string, text: string): Prom
 
     return { success: true, contactMatched: true };
   } catch (error) {
-    console.error(`[WhatsApp Inbound Error] Erro ao processar mensagem recebida:`, error);
+    console.error('[WhatsApp Sync Error] Erro ao processar mensagem do WhatsApp:', error);
     return { success: false, contactMatched: false };
   }
 }
 
-// Check if a number is registered on WhatsApp using Evolution API
-export async function checkWhatsappExists(phone: string): Promise<{ exists: boolean; jid?: string }> {
-  const db = await getDb();
-  
-  // Load Settings
-  const settingsList = await db.all('SELECT * FROM settings');
-  const settings: Record<string, string> = {};
-  settingsList.forEach(row => {
-    settings[row.key] = row.value || '';
-  });
-
-  const url = settings['evolution_api_url'] || '';
-  const token = settings['evolution_api_token'] || '';
-  const instanceName = settings['evolution_instance_name'] || '';
-  const cleanedPhone = cleanPhoneNumber(phone);
-
-  if (url && token && instanceName && cleanedPhone) {
-    try {
-      console.log(`[WhatsApp] Verificando existência de WhatsApp para ${cleanedPhone} via Evolution API...`);
-      // Endpoint: {api_url}/chat/checkNumber/{instanceName}
-      const response = await fetch(`${url.replace(/\/$/, '')}/chat/checkNumber/${instanceName}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': token
-        },
-        body: JSON.stringify({
-          numbers: [cleanedPhone]
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        // Evolution API usually returns an array of objects
-        const result = Array.isArray(data) ? data[0] : data;
-        
-        console.log(`[WhatsApp Verification] Resultado para ${cleanedPhone}: exists=${result?.exists}`);
-        
-        return {
-          exists: result?.exists === true,
-          jid: result?.jid || undefined
-        };
-      } else {
-        const errorText = await response.text();
-        console.error(`[WhatsApp Verification Error] Status: ${response.status}. Detalhes:`, errorText);
-      }
-    } catch (error) {
-      console.error(`[WhatsApp Verification Error] Falha ao conectar:`, error);
-    }
-  }
-
-  // Mock Mode fallback: Default to true for testing, unless phone starts with '999' or '000'
-  console.log(`[WhatsApp Verification MOCK] Número ${cleanedPhone} verificado como VÁLIDO por padrão no modo simulado.`);
-  if (cleanedPhone.startsWith('999') || cleanedPhone.startsWith('000') || cleanedPhone === '') {
-    return { exists: false };
-  }
-  return { exists: true, jid: `${cleanedPhone}@s.whatsapp.net` };
+export async function processIncomingWhatsapp(
+  phone: string,
+  text: string
+): Promise<{ success: boolean; contactMatched: boolean; replyText?: string }> {
+  return processWhatsappSyncMessage(phone, text, 'inbound');
 }
 
+export async function checkWhatsappExists(phone: string): Promise<{ exists: boolean; jid?: string }> {
+  const cleanedPhone = cleanPhoneNumber(phone);
+  const baileysStatus = getBaileysStatus();
+
+  if (baileysStatus.state !== 'connected' || !cleanedPhone) {
+    console.warn(`[WhatsApp Verification] Baileys nao conectado. Nao foi possivel validar ${cleanedPhone || phone}.`);
+    return { exists: false };
+  }
+
+  try {
+    const sock = getBaileysSock();
+    if (sock && typeof sock.onWhatsApp === 'function') {
+      console.log(`[WhatsApp] Verificando ${cleanedPhone} via Baileys...`);
+      const result = await sock.onWhatsApp(cleanedPhone);
+      if (result && result.length > 0) {
+        const exists = result[0].exists === true;
+        console.log(`[WhatsApp Verification] Baileys: ${cleanedPhone} exists=${exists}`);
+        return { exists, jid: exists ? result[0].jid : undefined };
+      }
+    }
+  } catch (error) {
+    console.warn('[WhatsApp Verification] Baileys check falhou:', error);
+  }
+
+  return { exists: false };
+}
+
+let baileysHandlerInitialized = false;
+
+export function initializeBaileysHandler() {
+  if (baileysHandlerInitialized) return;
+  baileysHandlerInitialized = true;
+
+  setBaileysMessageHandler(async (phone, text, key, direction, pushName) => {
+    await processWhatsappSyncMessage(phone, text, direction, key.id || undefined, pushName);
+  });
+
+  onBaileysConnected(async () => {
+    try {
+      const db = await getDb();
+      const contacts = await db.all("SELECT phone FROM contacts WHERE phone IS NOT NULL AND phone != ''");
+      const phones = contacts.map((c: any) => cleanPhoneNumber(c.phone));
+      await buildJidMap(phones);
+    } catch (e) {
+      console.warn('[WhatsApp] Erro ao construir mapa JID na conexao:', e);
+    }
+  });
+
+  startBaileys().catch((err) => {
+    console.warn('[WhatsApp] Baileys auto-start falhou:', err);
+  });
+
+  console.log('[WhatsApp] Baileys handler registrado e conexao iniciada.');
+}
+
+if (
+  typeof process !== 'undefined'
+  && process.env.NEXT_RUNTIME !== 'edge'
+  && process.env.NEXT_PHASE !== 'phase-production-build'
+) {
+  initializeBaileysHandler();
+}

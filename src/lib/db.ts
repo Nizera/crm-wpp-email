@@ -123,6 +123,17 @@ async function initializeDatabase(db: Database) {
     )
   `);
 
+  const whatsappMessagesInfo = await db.all("PRAGMA table_info(whatsapp_messages)");
+  const hasWhatsappMessageId = whatsappMessagesInfo.some((col) => col.name === 'whatsapp_message_id');
+  if (!hasWhatsappMessageId) {
+    await db.exec("ALTER TABLE whatsapp_messages ADD COLUMN whatsapp_message_id TEXT");
+  }
+  await db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_messages_message_id
+    ON whatsapp_messages(whatsapp_message_id)
+    WHERE whatsapp_message_id IS NOT NULL
+  `);
+
   // Alter contacts table safely if columns do not exist
   const tableInfo = await db.all("PRAGMA table_info(contacts)");
   const hasAgentActive = tableInfo.some((col) => col.name === 'whatsapp_agent_active');
@@ -178,12 +189,13 @@ Best regards,
     await db.run("INSERT INTO settings (key, value) VALUES ('inbound_domain', '')");
   }
 
-  // Seed WhatsApp / Evolution API default settings if they don't exist
-  const evolutionUrl = await db.get("SELECT value FROM settings WHERE key = 'evolution_api_url'");
-  if (!evolutionUrl) {
-    await db.run("INSERT INTO settings (key, value) VALUES ('evolution_api_url', 'http://localhost:8080')");
-    await db.run("INSERT INTO settings (key, value) VALUES ('evolution_api_token', '')");
-    await db.run("INSERT INTO settings (key, value) VALUES ('evolution_instance_name', '')");
+  const serperKey = await db.get("SELECT value FROM settings WHERE key = 'serper_api_key'");
+  if (!serperKey) {
+    await db.run("INSERT INTO settings (key, value) VALUES ('serper_api_key', '')");
+  }
+
+  const whatsappAgentProvider = await db.get("SELECT value FROM settings WHERE key = 'whatsapp_agent_provider'");
+  if (!whatsappAgentProvider) {
     await db.run("INSERT INTO settings (key, value) VALUES ('whatsapp_agent_provider', 'gemini')");
     await db.run("INSERT INTO settings (key, value) VALUES ('whatsapp_agent_model', 'gemini-1.5-flash')");
     await db.run("INSERT INTO settings (key, value) VALUES ('whatsapp_agent_api_key', '')");

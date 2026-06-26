@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
+import { initializeBaileysHandler } from '@/lib/whatsapp';
 
 export async function GET() {
   try {
+    initializeBaileysHandler();
     const db = await getDb();
     
     // Retrieve contacts with phone and their last WhatsApp message information
